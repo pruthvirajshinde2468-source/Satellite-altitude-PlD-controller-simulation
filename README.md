@@ -40,11 +40,52 @@ Challenge: Sensitive to measurement noise
 
 Satellite Dynamics:
 
+I × α = τ_control - τ_disturbance - damping
+
+I = Moment of inertia (resistance to rotation)
+α = Angular acceleration (d²θ/dt²)
+τ_control = Control torque from PID
+τ_disturbance = External disturbance torques
+damping = Natural damping in the system
+
+theta_ddot = (torque - self.damping * theta_dot) / self.inertia
+ddot = double derivative
+dot = derivative 
+
+Net Torque = Control Torque - Damping Torque
+τ_net = τ_control - b × ω
+
+Where:
+- b = damping coefficient (N·m·s/rad)
+- ω = angular velocity (rad/s) = dθ/dt
+
+From τ_net = I × α:
+I × d²θ/dt² = τ_control - b × dθ/dt
+
+Rearranging:
+d²θ/dt² = (τ_control - b × dθ/dt) / I
+
+θ_ddot = (torque - damping × θ_dot) / inertia
 
 
+Satellite angle → We want it at 0 degrees
+
+What makes satellite turn faster? = (Our Control Push - Natural Slow Down) / How Heavy It Is
+turn_speed_change = (our_force - natural_slowdown * current_speed) / satellite_weight
+
+Control loop:
+Disturbances → Satellite → Current Angle → Error → PID → Control Torque
 
 
+Step-by-step Process:
+Measure current satellite angle
 
+Calculate error: desired_angle - current_angle
 
+Compute PID terms:
 
-
+P: Immediate correction based on current error
+I: Correction based on accumulated past errors
+D: Predictive correction based on error trend
+Apply the calculated control torque
+Repeat continuously
