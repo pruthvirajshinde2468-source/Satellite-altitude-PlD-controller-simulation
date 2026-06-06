@@ -1,145 +1,220 @@
 """
 Satellite Dynamics Model
 
-Implements the satellite attitude dynamics equations:
-I × α = τ_control - τ_disturbance - damping
+Single-axis rigid-body attitude dynamics:
+    I·α = τ_control - τ_disturbance - b·ω
 
-Where:
-- I: Moment of inertia (kg·m²)
-- α: Angular acceleration (rad/s²)
-- τ_control: Control torque from thrusters/reaction wheels (N·m)
-- τ_disturbance: External disturbance torques (N·m)
-- damping: Natural damping in the system (N·m·s/rad)
+Improvements vs. original:
+  - 4th-order Runge-Kutta (RK4) integration replaces forward Euler
+  - Angle wrapped to [-π, π] to prevent unbounded accumulation
+  - SensorModel adds realistic Gaussian measurement noise
+  - DisturbanceModel uses configurable periods (defaults match original)
+  - ReactionWheel models actuator momentum and saturation
 """
 
 import numpy as np
 from dataclasses import dataclass
 
 
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class SatelliteState:
-    """Current state of the satellite"""
-    angle: float = 0.0  # Current angle θ (radians)
-    angular_velocity: float = 0.0  # Angular velocity dθ/dt (rad/s)
-    angular_acceleration: float = 0.0  # Angular acceleration d²θ/dt² (rad/s²)
+    angle: float = 0.0                # θ        (rad)
+    angular_velocity: float = 0.0    # ω = dθ/dt  (rad/s)
+    angular_acceleration: float = 0.0  # α = dω/dt  (rad/s²)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
 class SatelliteDynamics:
-    """Satellite attitude dynamics model"""
-    
+    """
+    Rigid-body single-axis attitude plant.
+
+    EOM:  I·α = τ_control - τ_disturbance - b·ω
+    """
+
     def __init__(self, inertia: float, damping_coeff: float):
-        """
-        Initialize satellite dynamics
-        
-        Args:
-            inertia: Moment of inertia (kg·m²)
-            damping_coeff: Damping coefficient (N·m·s/rad)
-        """
-        self.inertia = inertia  # I
-        self.damping = damping_coeff  # b (damping coefficient)
+        self.inertia = inertia
+        self.damping = damping_coeff
         self.state = SatelliteState()
-        
-    def get_state(self) -> SatelliteState:
-        """Return current satellite state"""
-        return self.state
-    
-    def update(self, control_torque: float, disturbance_torque: float, dt: float):
+
+    # ── integration ──────────────────────────────────────────────────
+    def _alpha(self, omega: float, tau_c: float, tau_d: float) -> float:
+        """Angular acceleration given current ω and torques."""
+        return (tau_c - tau_d - self.damping * omega) / self.inertia
+
+    def update(self, control_torque: float, disturbance_torque: float, dt: float,
+               method: str = 'rk4'):
         """
-        Update satellite dynamics for time step dt
-        
-        Dynamics equation:
-        d²θ/dt² = (τ_control - τ_disturbance - b × dθ/dt) / I
-        
+        Advance the state by dt.
+
         Args:
-            control_torque: Control torque applied by thrusters/reaction wheels (N·m)
-            disturbance_torque: External disturbance torque (N·m)
-            dt: Time step (seconds)
+            control_torque:     Applied torque from actuator (N·m)
+            disturbance_torque: Environmental disturbance torque (N·m)
+            dt:                 Time step (s)
+            method:             'rk4' (default) or 'euler'
         """
-        # Calculate net torque
-        # τ_net = τ_control - τ_disturbance - damping × ω
-        net_torque = control_torque - disturbance_torque - (self.damping * self.state.angular_velocity)
-        
-        # Calculate angular acceleration: α = τ_net / I
-        angular_acceleration = net_torque / self.inertia
-        self.state.angular_acceleration = angular_acceleration
-        
-        # Update angular velocity: ω = ω + α × dt
-        self.state.angular_velocity += angular_acceleration * dt
-        
-        # Update angle: θ = θ + ω × dt
-        self.state.angle += self.state.angular_velocity * dt
-        
+        if method == 'rk4':
+            self._rk4_step(control_torque, disturbance_torque, dt)
+        else:
+            self._euler_step(control_torque, disturbance_torque, dt)
+
+        # Wrap to [-π, π]
+        self.state.angle = (self.state.angle + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _rk4_step(self, tau_c: float, tau_d: float, dt: float):
+        """4th-order Runge-Kutta integration for [θ, ω]."""
+        θ = self.state.angle
+        ω = self.state.angular_velocity
+
+        # Stage derivatives  (dθ/dt = ω,  dω/dt = α)
+        k1ω = self._alpha(ω, tau_c, tau_d)
+        k1θ = ω
+
+        k2ω = self._alpha(ω + 0.5 * dt * k1ω, tau_c, tau_d)
+        k2θ = ω + 0.5 * dt * k1ω
+
+        k3ω = self._alpha(ω + 0.5 * dt * k2ω, tau_c, tau_d)
+        k3θ = ω + 0.5 * dt * k2ω
+
+        k4ω = self._alpha(ω + dt * k3ω, tau_c, tau_d)
+        k4θ = ω + dt * k3ω
+
+        self.state.angle              = θ + (dt / 6.0) * (k1θ + 2*k2θ + 2*k3θ + k4θ)
+        self.state.angular_velocity   = ω + (dt / 6.0) * (k1ω + 2*k2ω + 2*k3ω + k4ω)
+        self.state.angular_acceleration = (k1ω + 2*k2ω + 2*k3ω + k4ω) / 6.0
+
+    def _euler_step(self, tau_c: float, tau_d: float, dt: float):
+        """Forward-Euler integration (kept for comparison)."""
+        alpha = self._alpha(self.state.angular_velocity, tau_c, tau_d)
+        self.state.angular_acceleration = alpha
+        self.state.angular_velocity    += alpha * dt
+        self.state.angle               += self.state.angular_velocity * dt
+
     def reset(self, initial_angle: float = 0.0, initial_velocity: float = 0.0):
-        """Reset satellite to initial conditions"""
-        self.state.angle = initial_angle
-        self.state.angular_velocity = initial_velocity
+        self.state.angle               = initial_angle
+        self.state.angular_velocity    = initial_velocity
         self.state.angular_acceleration = 0.0
 
+    def get_state(self) -> SatelliteState:
+        return self.state
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+class SensorModel:
+    """
+    Gaussian measurement noise on angle and angular-velocity readings.
+
+    Typical hardware noise floors:
+        Star tracker : 1–5 arcsec  ≈ 5e-6 – 2.4e-5 rad
+        Rate gyro    : 0.01 deg/s  ≈ 1.7e-4 rad/s
+    """
+
+    def __init__(self, angle_std: float = 0.0001, velocity_std: float = 0.00005,
+                 enabled: bool = True, seed: int = None):
+        self.angle_std    = angle_std
+        self.velocity_std = velocity_std
+        self.enabled      = enabled
+        self._rng = np.random.default_rng(seed)
+
+    def measure(self, true_angle: float, true_velocity: float):
+        """Return (noisy_angle, noisy_velocity)."""
+        if not self.enabled:
+            return true_angle, true_velocity
+        return (true_angle    + self._rng.normal(0.0, self.angle_std),
+                true_velocity + self._rng.normal(0.0, self.velocity_std))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 class DisturbanceModel:
     """
-    Models external disturbances acting on the satellite:
-    - Solar pressure torque
-    - Gravity gradient torque
-    - Magnetic torques
+    Three independent sinusoidal disturbance torques:
+      solar pressure, gravity gradient, magnetic field.
+
+    Default periods match the original formulation:
+        solar    : 2π t / 100   → period = 100 s
+        gravity  : 3π t / 100   → period =  66.7 s
+        magnetic : 5π t / 100   → period =  40 s
     """
-    
+
     def __init__(self, max_solar_torque: float = 0.001,
                  max_gravity_torque: float = 0.0015,
-                 max_magnetic_torque: float = 0.001):
-        """
-        Initialize disturbance model
-        
-        Args:
-            max_solar_torque: Maximum solar pressure torque (N·m)
-            max_gravity_torque: Maximum gravity gradient torque (N·m)
-            max_magnetic_torque: Maximum magnetic field torque (N·m)
-        """
-        self.max_solar = max_solar_torque
-        self.max_gravity = max_gravity_torque
+                 max_magnetic_torque: float = 0.001,
+                 solar_period: float = 100.0,
+                 gravity_period: float = 66.7,
+                 magnetic_period: float = 40.0):
+        self.max_solar    = max_solar_torque
+        self.max_gravity  = max_gravity_torque
         self.max_magnetic = max_magnetic_torque
-        self.time = 0.0
-        
+        self.solar_period    = solar_period
+        self.gravity_period  = gravity_period
+        self.magnetic_period = magnetic_period
+
+    def _solar(self, t):
+        return self.max_solar * np.sin(2 * np.pi * t / self.solar_period)
+
+    def _gravity(self, t):
+        return self.max_gravity * np.sin(2 * np.pi * t / self.gravity_period)
+
+    def _magnetic(self, t):
+        return self.max_magnetic * np.sin(2 * np.pi * t / self.magnetic_period)
+
     def get_total_disturbance(self, time: float) -> float:
-        """
-        Calculate total disturbance torque at given time
-        
-        Uses sinusoidal perturbations to simulate time-varying disturbances
-        
-        Args:
-            time: Current simulation time (seconds)
-            
-        Returns:
-            Total disturbance torque (N·m)
-        """
-        # Solar pressure torque: varies with orbital position
-        solar_torque = self.max_solar * np.sin(2 * np.pi * time / 100.0)
-        
-        # Gravity gradient torque: periodic component
-        gravity_torque = self.max_gravity * np.sin(3 * np.pi * time / 100.0)
-        
-        # Magnetic field torque: higher frequency disturbance
-        magnetic_torque = self.max_magnetic * np.sin(5 * np.pi * time / 100.0)
-        
-        return solar_torque + gravity_torque + magnetic_torque
-    
+        return self._solar(time) + self._gravity(time) + self._magnetic(time)
+
     def get_disturbance_components(self, time: float) -> dict:
+        s = self._solar(time)
+        g = self._gravity(time)
+        m = self._magnetic(time)
+        return {'solar': s, 'gravity': g, 'magnetic': m, 'total': s + g + m}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+class ReactionWheel:
+    """
+    Single-axis reaction-wheel actuator model.
+
+    The wheel stores angular momentum H.  Applying a torque τ to the satellite
+    spins the wheel in the opposite direction:  dH/dt = τ.
+
+    Limits modelled:
+      max_torque   — motor peak torque  (N·m)
+      max_momentum — wheel saturation   (N·m·s = kg·m²/s)
+    """
+
+    def __init__(self, wheel_inertia: float = 0.01,
+                 max_torque: float = 0.1,
+                 max_momentum: float = 1.0):
+        self.wheel_inertia = wheel_inertia  # kg·m²
+        self.max_torque    = max_torque     # N·m
+        self.max_momentum  = max_momentum   # N·m·s
+        self.momentum = 0.0  # H_rw (N·m·s)
+        self.speed    = 0.0  # ω_rw (rad/s)
+
+    def apply_torque(self, commanded: float, dt: float) -> float:
         """
-        Get individual disturbance components for analysis
-        
-        Args:
-            time: Current simulation time (seconds)
-            
-        Returns:
-            Dictionary with solar, gravity, and magnetic torques
+        Clamp commanded torque to motor and momentum limits.
+
+        Returns the actual torque delivered to the satellite.
         """
-        solar = self.max_solar * np.sin(2 * np.pi * time / 100.0)
-        gravity = self.max_gravity * np.sin(3 * np.pi * time / 100.0)
-        magnetic = self.max_magnetic * np.sin(5 * np.pi * time / 100.0)
-        
-        return {
-            'solar': solar,
-            'gravity': gravity,
-            'magnetic': magnetic,
-            'total': solar + gravity + magnetic
-        }
+        # Motor torque limit
+        actual = max(-self.max_torque, min(self.max_torque, commanded))
+
+        # Momentum saturation: would adding this torque overflow the wheel?
+        new_momentum = self.momentum + actual * dt
+        if new_momentum > self.max_momentum:
+            actual = (self.max_momentum - self.momentum) / dt
+        elif new_momentum < -self.max_momentum:
+            actual = (-self.max_momentum - self.momentum) / dt
+
+        self.momentum += actual * dt
+        self.speed     = self.momentum / self.wheel_inertia
+        return actual
+
+    @property
+    def saturation_fraction(self) -> float:
+        """Fraction of max momentum in use (0–1).  >0.8 ≈ approaching saturation."""
+        return abs(self.momentum) / self.max_momentum
+
+    def reset(self):
+        self.momentum = 0.0
+        self.speed    = 0.0
